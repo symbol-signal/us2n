@@ -9,6 +9,8 @@ import network
 
 print_ = print
 VERBOSE = 1
+
+
 def print(*args, **kwargs):
     if VERBOSE:
         print_(*args, **kwargs)
@@ -32,6 +34,7 @@ def parse_bind_address(addr, default=None):
     port = int(args[1])
     return host, port
 
+
 class RINGBUFFER:
     def __init__(self, size):
         self.data = bytearray(size)
@@ -44,11 +47,11 @@ class RINGBUFFER:
     def put(self, data):
         cur_idx = 0
         while cur_idx < len(data):
-            min_idx = min(self.index_put+len(data)-cur_idx, self.size)
-            self.data[self.index_put:min_idx] = data[cur_idx:min_idx-self.index_put+cur_idx]
-            cur_idx += min_idx-self.index_put
+            min_idx = min(self.index_put + len(data) - cur_idx, self.size)
+            self.data[self.index_put:min_idx] = data[cur_idx:min_idx - self.index_put + cur_idx]
+            cur_idx += min_idx - self.index_put
             if self.index_get > self.index_put:
-                self.index_get = max(min_idx+1, self.index_get)
+                self.index_get = max(min_idx + 1, self.index_get)
                 if self.index_get >= self.size:
                     self.index_get -= self.size
             self.index_put = min_idx
@@ -71,7 +74,7 @@ class RINGBUFFER:
         data = bytearray()
         while len(data) < numbytes:
             start = self.index_get
-            min_idx = min(self.index_get+numbytes-len(data), self.size)
+            min_idx = min(self.index_get + numbytes - len(data), self.size)
             if self.index_put >= self.index_get:
                 min_idx = min(min_idx, self.index_put)
             data.extend(self.data[start:min_idx])
@@ -95,9 +98,10 @@ class RINGBUFFER:
 
     def rewind(self):
         if self.wrapped:
-            self.index_get = (self.index_put+1) % self.size
+            self.index_get = (self.index_put + 1) % self.size
         else:
             self.index_get = 0
+
 
 def UART(config):
     config = dict(config)
@@ -105,7 +109,9 @@ def UART(config):
     port = config.pop('port')
     if uart_type == 'SoftUART':
         print('Using SoftUART...')
-        uart = machine.SoftUART(machine.Pin(config.pop('tx')),machine.Pin(config.pop('rx')),timeout=config.pop('timeout'),timeout_char=config.pop('timeout_char'),baudrate=config.pop('baudrate'))
+        uart = machine.SoftUART(machine.Pin(config.pop('tx')), machine.Pin(config.pop('rx')),
+                                timeout=config.pop('timeout'), timeout_char=config.pop('timeout_char'),
+                                baudrate=config.pop('baudrate'))
     else:
         print('Using HW UART...')
         uart = machine.UART(port)
@@ -135,7 +141,7 @@ class Bridge:
     def bind(self):
         tcp = socket.socket()
         tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    #    tcp.setblocking(False)
+        #    tcp.setblocking(False)
         tcp.bind(self.address)
         tcp.listen(5)
         print('Bridge listening at TCP({0}) for UART({1})'
@@ -198,13 +204,13 @@ class Bridge:
                                 self.sendall(self.client, "\r\nAuthentication succeeded\r\n")
                                 self.state = 'authenticated'
                                 self.ring_buffer.rewind()
-                                fd = self.uart # Send all uart data
+                                fd = self.uart  # Send all uart data
                                 break
                             else:
                                 self.password = b""
                                 self.sendall(self.client, "\r\nAuthentication failed\r\npassword: ")
                         else:
-                                self.password += c
+                            self.password += c
                 if self.state == 'authenticated':
                     print('TCP({0})->UART({1}) {2}'.format(self.bind_port,
                                                            self.uart_port, data))
@@ -282,7 +288,7 @@ class S2NServer:
 
     def serve_forever(self):
         while True:
-            config_network(self.config.get('wlan'), self.config.get('name'))
+            config_network(self.config)
             try:
                 self._serve_forever()
             except KeyboardInterrupt:
@@ -323,19 +329,50 @@ class S2NServer:
                 bridge.close()
 
 
-def config_lan(config, name):
-    # For a board which has LAN
-    pass
+def config_lan(config):
+    if config is None:
+        return None
+
+    # Get parameters from config
+    mdc_pin = config.get('mdc', 23)
+    mdio_pin = config.get('mdio', 18)
+    power_pin = config.get('power', 12)
+    phy_type = config.get('phy_type', 0)
+    phy_addr = config.get('phy_addr', 0)
+
+    # Initialize LAN
+    print('Initializing Ethernet...')
+    lan = network.LAN(mdc=machine.Pin(mdc_pin), mdio=machine.Pin(mdio_pin),
+                      power=machine.Pin(power_pin), phy_type=phy_type,
+                      phy_addr=phy_addr)
+
+    # Activate
+    lan.active(True)
+    print('Waiting for Ethernet connection...')
+
+    # Wait for DHCP
+    for i in range(30):
+        if lan.isconnected():
+            print('Ethernet connected as {0}'.format(lan.ifconfig()))
+            return lan
+        time.sleep(1)
+        print('Waiting for DHCP...')
+
+    if lan.status() > 0:
+        print('Physical link is up, but no IP address obtained')
+    else:
+        print('Physical link is down')
+
+    return lan
 
 
 def config_wlan(config, name):
     if config is None:
         return None, None
-    return (WLANStation(config.get('sta'), name),
-            WLANAccessPoint(config.get('ap'), name))
+    return WLANStation(config.get('sta')), WLANAccessPoint(config.get('ap'), name)
 
 
-def WLANStation(config, name):
+def WLANStation(config):
     if config is None:
         return
     config.setdefault('connection_attempts', -1)
@@ -353,7 +390,7 @@ def WLANStation(config, name):
             sta.connect(essid, password)
             print('Connecting to WiFi...')
             n, ms = 20, 250
-            t = n*ms
+            t = n * ms
             while not sta.isconnected() and n > 0:
                 time.sleep_ms(ms)
                 n -= 1
@@ -371,10 +408,10 @@ def WLANAccessPoint(config, name):
     config.setdefault('essid', name)
     config.setdefault('channel', 11)
     config.setdefault('authmode',
-                      getattr(network,'AUTH_' +
+                      getattr(network, 'AUTH_' +
                               config.get('authmode', 'OPEN').upper()))
     config.setdefault('hidden', False)
-#    config.setdefault('dhcp_hostname', name)
+    #    config.setdefault('dhcp_hostname', name)
     ap = network.WLAN(network.AP_IF)
     if not ap.isconnected():
         ap.active(True)
@@ -388,15 +425,19 @@ def WLANAccessPoint(config, name):
                   'I give up'.format(t))
             return ap
 
-#    ap.config(**config)
+    #    ap.config(**config)
     print('Wifi {0!r} connected as {1}'.format(ap.config('essid'),
                                                ap.ifconfig()))
     return ap
 
 
-def config_network(config, name):
-    config_lan(config, name)
-    config_wlan(config, name)
+def config_network(config):
+    if 'lan' in config:
+        print("LAN configuration found, initializing...")
+        config_lan(config.get('lan'))
+    if 'wlan' in config:
+        print("WLAN configuration found, initializing...")
+        config_wlan(config.get('wlan'), config.get('name'))
 
 
 def config_verbosity(config):
@@ -412,6 +453,6 @@ def server(config_filename='us2n.json'):
     VERBOSE = config.setdefault('verbose', 1)
     name = config.setdefault('name', 'Tiago-ESP32')
     config_verbosity(config)
-    print(50*'=')
+    print(50 * '=')
     print('Welcome to ESP8266/32 serial <-> tcp bridge\n')
     return S2NServer(config)
