@@ -244,32 +244,39 @@ class Bridge:
             return None
 
     def handle(self, fd):
-        """Handle I/O events on sockets and UART"""
+        """Handle I/O events on sockets and UART with reduced logging"""
         if fd == self.tcp:
             print("Incoming connection detected...")
             self.close_client()
             self.open_client()
         elif fd == self.client:
-            data = self.recv(self.client, 4096)
-            if data:
-                if self.state == 'enterpassword':
-                    self._handle_password(data)
-                elif self.state == 'authenticated':
-                    print('TCP({0})->UART({1}) {2}'.format(
-                        self.bind_port, self.uart_port, data))
-                    self.uart.write(data)
-            else:
-                print('Client', self.client_address, 'disconnected')
+            try:
+                data = self.recv(self.client, 4096)
+                if data:
+                    if self.state == 'enterpassword':
+                        self._handle_password(data)
+                    elif self.state == 'authenticated':
+                        # Only log that data is being sent, not the actual data
+                        print(f'TCP({self.bind_port})->UART({self.uart_port}): {len(data)} bytes')
+                        self.uart.write(data)
+                else:
+                    print('Client', self.client_address, 'disconnected')
+                    self.close_client()
+            except Exception as e:
+                print(f"Error handling client data: {e}")
                 self.close_client()
         elif fd == self.uart:
-            data = self.uart.read(64)
-            if data is not None:
-                self.ring_buffer.put(data)
-            if self.state == 'authenticated' and self.ring_buffer.has_data():
-                data = self.ring_buffer.get(4096)
-                print('UART({0})->TCP({1}) {2}'.format(
-                    self.uart_port, self.bind_port, data))
-                self.sendall(self.client, data)
+            try:
+                data = self.uart.read(64)
+                if data is not None:
+                    self.ring_buffer.put(data)
+                if self.state == 'authenticated' and self.ring_buffer.has_data():
+                    data = self.ring_buffer.get(4096)
+                    # Only log that data is being sent, not the actual data
+                    print(f'UART({self.uart_port})->TCP({self.bind_port}): {len(data)} bytes')
+                    self.sendall(self.client, data)
+            except Exception as e:
+                print(f"Error handling UART data: {e}")
 
     def _handle_password(self, data):
         """Handle password authentication"""
@@ -473,12 +480,8 @@ class S2NServer:
                     time.sleep(1)
                     continue
 
-                print(f"Waiting on select with {len(fds)} file descriptors")
                 try:
                     rlist, _, xlist = select.select(fds, (), fds, 10)  # 10 second timeout
-
-                    print(f"Select returned {len(rlist)} ready, {len(xlist)} exceptions")
-
                     if xlist:
                         print('Errors on these descriptors:', xlist)
                         break
