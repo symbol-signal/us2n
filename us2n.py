@@ -1,4 +1,5 @@
-# us2n.py
+# us2n.py - UART to TCP Bridge for ESP32-POE-ISO
+# Revised version with Ethernet support and improved error handling
 
 import json
 import time
@@ -6,12 +7,17 @@ import select
 import socket
 import machine
 import network
+import gc
 
-print_ = print
+# Configure verbosity for debugging
 VERBOSE = 1
+
+# Original print function preserved
+print_ = print
 
 
 def print(*args, **kwargs):
+    """Custom print function that respects verbosity setting"""
     if VERBOSE:
         print_(*args, **kwargs)
 
@@ -25,17 +31,25 @@ def read_config(filename='us2n.json', obj=None, default=None):
 
 
 def parse_bind_address(addr, default=None):
+    """Parse the bind address from config, ensuring a valid address is returned"""
     if addr is None:
         return default
+
     args = addr
     if not isinstance(args, (list, tuple)):
         args = addr.rsplit(':', 1)
-    host = '' if len(args) == 1 or args[0] == '0' else args[0]
-    port = int(args[1])
+
+    # Always use '0.0.0.0' for binding to all interfaces
+    host = '0.0.0.0' if len(args) == 1 or args[0] == '' or args[0] == '0' else args[0]
+    port = int(args[-1]) if len(args) > 1 else 8000
+
+    print(f"Parsed bind address: {host}:{port}")
     return host, port
 
 
 class RINGBUFFER:
+    """Ring buffer implementation for data buffering"""
+
     def __init__(self, size):
         self.data = bytearray(size)
         self.size = size
@@ -104,22 +118,41 @@ class RINGBUFFER:
 
 
 def UART(config):
+    """Initialize UART with the given configuration"""
     config = dict(config)
     uart_type = config.pop('type') if 'type' in config.keys() else 'hw'
     port = config.pop('port')
+
     if uart_type == 'SoftUART':
         print('Using SoftUART...')
-        uart = machine.SoftUART(machine.Pin(config.pop('tx')), machine.Pin(config.pop('rx')),
-                                timeout=config.pop('timeout'), timeout_char=config.pop('timeout_char'),
-                                baudrate=config.pop('baudrate'))
+        uart = machine.SoftUART(
+            machine.Pin(config.pop('tx')),
+            machine.Pin(config.pop('rx')),
+            timeout=config.pop('timeout'),
+            timeout_char=config.pop('timeout_char'),
+            baudrate=config.pop('baudrate')
+        )
     else:
         print('Using HW UART...')
-        uart = machine.UART(port)
+        tx_pin = config.pop('tx') if 'tx' in config else None
+        rx_pin = config.pop('rx') if 'rx' in config else None
+
+        if tx_pin is not None and rx_pin is not None:
+            uart = machine.UART(
+                port,
+                tx=machine.Pin(tx_pin),
+                rx=machine.Pin(rx_pin)
+            )
+        else:
+            uart = machine.UART(port)
+
         uart.init(**config)
+
     return uart
 
 
 class Bridge:
+    """Bridge class that connects UART to TCP"""
 
     def __init__(self, config):
         super().__init__()
@@ -139,31 +172,45 @@ class Bridge:
         print(self.config)
 
     def bind(self):
+        """Bind to the configured TCP address and port"""
         tcp = socket.socket()
         tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        #    tcp.setblocking(False)
+        # Ensure socket is in blocking mode for reliable operation
+        tcp.setblocking(True)
+
+        print(f"Binding to address: {self.address}")
         tcp.bind(self.address)
         tcp.listen(5)
         print('Bridge listening at TCP({0}) for UART({1})'
               .format(self.bind_port, self.uart_port))
+
         self.tcp = tcp
+
+        # Configure SSL if needed
         if 'ssl' in self.config:
-            import ntptime
-            ntptime.host = "pool.ntp.org"
-            while True:
-                try:
-                    ntptime.settime()
-                except OSError as e:
-                    print(f"NTP synchronization failed, {e}")
-                    time.sleep(15)
-                    continue
-                print(f"NTP synchronization succeeded, {time.time()}")
-                print(time.gmtime())
-                break
+            self._setup_ssl()
 
         return tcp
 
+    def _setup_ssl(self):
+        """Setup SSL configuration if enabled"""
+        import ntptime
+        print("Setting up SSL, syncing NTP time...")
+        ntptime.host = "pool.ntp.org"
+        attempt = 0
+        while attempt < 3:
+            try:
+                ntptime.settime()
+                print(f"NTP synchronization succeeded, {time.time()}")
+                print(time.gmtime())
+                break
+            except OSError as e:
+                print(f"NTP synchronization failed, {e}")
+                attempt += 1
+                time.sleep(5)
+
     def fill(self, fds):
+        """Fill the file descriptor list for select"""
         if self.uart is not None:
             fds.append(self.uart)
         if self.tcp is not None:
@@ -173,104 +220,185 @@ class Bridge:
         return fds
 
     def recv(self, sock, n):
-        if hasattr(sock, 'recv'):
-            return sock.recv(n)
-        else:
-            # SSL-wrapped sockets don't have recv(), use read() instead
-            # TODO: Read more than 1 byte? Probably needs non-blocking sockets
-            return sock.read(1)
+        """Receive data from a socket, handling both regular and SSL sockets"""
+        try:
+            if hasattr(sock, 'recv'):
+                return sock.recv(n)
+            else:
+                # SSL-wrapped sockets don't have recv(), use read() instead
+                return sock.read(n)
+        except Exception as e:
+            print("Error receiving data:", e)
+            return b''
 
-    def sendall(self, sock, bytes):
-        if hasattr(sock, 'sendall'):
-            return sock.sendall(bytes)
-        else:
-            # SSL-wrapped sockets don't have sendall(), use write() instead
-            return sock.write(bytes)
+    def sendall(self, sock, bytes_data):
+        """Send data to a socket, handling both regular and SSL sockets"""
+        try:
+            if hasattr(sock, 'sendall'):
+                return sock.sendall(bytes_data)
+            else:
+                # SSL-wrapped sockets don't have sendall(), use write() instead
+                return sock.write(bytes_data)
+        except Exception as e:
+            print("Error sending data:", e)
+            return None
 
     def handle(self, fd):
+        """Handle I/O events on sockets and UART"""
         if fd == self.tcp:
+            print("Incoming connection detected...")
             self.close_client()
             self.open_client()
         elif fd == self.client:
             data = self.recv(self.client, 4096)
             if data:
                 if self.state == 'enterpassword':
-                    while len(data):
-                        c = data[0:1]
-                        data = data[1:]
-                        if c == b'\n' or c == b'\r':
-                            print("Received password {0}".format(self.password))
-                            if self.password.decode('utf-8') == self.config['auth']['password']:
-                                self.sendall(self.client, "\r\nAuthentication succeeded\r\n")
-                                self.state = 'authenticated'
-                                self.ring_buffer.rewind()
-                                fd = self.uart  # Send all uart data
-                                break
-                            else:
-                                self.password = b""
-                                self.sendall(self.client, "\r\nAuthentication failed\r\npassword: ")
-                        else:
-                            self.password += c
-                if self.state == 'authenticated':
-                    print('TCP({0})->UART({1}) {2}'.format(self.bind_port,
-                                                           self.uart_port, data))
+                    self._handle_password(data)
+                elif self.state == 'authenticated':
+                    print('TCP({0})->UART({1}) {2}'.format(
+                        self.bind_port, self.uart_port, data))
                     self.uart.write(data)
             else:
-                print('Client ', self.client_address, ' disconnected')
+                print('Client', self.client_address, 'disconnected')
                 self.close_client()
-        if fd == self.uart:
+        elif fd == self.uart:
             data = self.uart.read(64)
             if data is not None:
                 self.ring_buffer.put(data)
             if self.state == 'authenticated' and self.ring_buffer.has_data():
                 data = self.ring_buffer.get(4096)
-                print('UART({0})->TCP({1}) {2}'.format(self.uart_port,
-                                                       self.bind_port, data))
+                print('UART({0})->TCP({1}) {2}'.format(
+                    self.uart_port, self.bind_port, data))
                 self.sendall(self.client, data)
 
+    def _handle_password(self, data):
+        """Handle password authentication"""
+        while len(data):
+            c = data[0:1]
+            data = data[1:]
+            if c == b'\n' or c == b'\r':
+                print("Received password {0}".format(self.password))
+                if self.password.decode('utf-8') == self.config['auth']['password']:
+                    self.sendall(self.client, b"\r\nAuthentication succeeded\r\n")
+                    self.state = 'authenticated'
+                    self.ring_buffer.rewind()
+                    break
+                else:
+                    self.password = b""
+                    self.sendall(self.client, b"\r\nAuthentication failed\r\npassword: ")
+            else:
+                self.password += c
+
     def close_client(self):
+        """Close the client connection"""
         if self.client is not None:
-            print('Closing client ', self.client_address)
-            self.client.close()
-            self.client = None
-            self.client_address = None
+            try:
+                print('Closing client', self.client_address)
+                self.client.close()
+            except Exception as e:
+                print("Error closing client:", e)
+            finally:
+                self.client = None
+                self.client_address = None
         self.state = 'listening'
 
     def open_client(self):
-        self.client, self.client_address = self.tcp.accept()
-        print('Accepted connection from ', self.client_address)
-        if 'ssl' in self.config:
+        """Open and initialize a new client connection"""
+        try:
+            self.client, self.client_address = self.tcp.accept()
+            print('Accepted connection from', self.client_address)
+
+            # Handle SSL if configured
+            if 'ssl' in self.config:
+                self._setup_client_ssl()
+
+            self.state = 'enterpassword' if 'auth' in self.config else 'authenticated'
+            self.password = b""
+
+            if self.state == 'enterpassword':
+                self.sendall(self.client, b"password: ")
+                print("Prompting for password")
+        except Exception as e:
+            print("Error opening client:", e)
+            import sys
+            sys.print_exception(e)
+            self.client = None
+            self.client_address = None
+
+    def _setup_client_ssl(self):
+        """Setup SSL for a client connection"""
+        try:
             import ussl
-            import ubinascii
-            print(time.gmtime())
+            print("Setting up SSL for client...")
+
             sslconf = self.config['ssl'].copy()
             for key in ['cadata', 'key', 'cert']:
                 if key in sslconf:
                     with open(sslconf[key], "rb") as file:
                         sslconf[key] = file.read()
-            # TODO: Setting CERT_REQUIRED produces MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+
+            # Setting CERT_OPTIONAL instead of REQUIRED to avoid certificate verification issues
             sslconf['cert_reqs'] = ussl.CERT_OPTIONAL
             self.client = ussl.wrap_socket(self.client, server_side=True, **sslconf)
-        self.state = 'enterpassword' if 'auth' in self.config else 'authenticated'
-        self.password = b""
-        if self.state == 'enterpassword':
-            self.sendall(self.client, "password: ")
-            print("Prompting for password")
+        except Exception as e:
+            print("Error setting up client SSL:", e)
+            import sys
+            sys.print_exception(e)
 
     def close(self):
+        """Close all connections"""
         self.close_client()
         if self.tcp is not None:
-            print('Closing TCP server {0}...'.format(self.address))
-            self.tcp.close()
-            self.tcp = None
+            try:
+                print('Closing TCP server {0}...'.format(self.address))
+                self.tcp.close()
+            except Exception as e:
+                print("Error closing TCP server:", e)
+            finally:
+                self.tcp = None
+
+    def direct_accept_test(self):
+        """Test direct connection acceptance without select"""
+        print(f"Running direct accept test on port {self.bind_port}")
+        if self.tcp:
+            self.tcp.setblocking(True)
+            while True:
+                try:
+                    print("Waiting for connection...")
+                    client, addr = self.tcp.accept()
+                    print(f"Accepted connection from {addr}")
+                    client.send(b"Hello from ESP32!\r\n")
+
+                    # Echo any received data
+                    while True:
+                        try:
+                            data = client.recv(1024)
+                            if not data:
+                                break
+                            print(f"Received: {data}")
+                            client.send(data)
+                        except:
+                            break
+
+                    client.close()
+                    print("Connection closed")
+                except Exception as e:
+                    print("Error in direct accept test:", e)
+                    import sys
+                    sys.print_exception(e)
+                    time.sleep(1)
+        else:
+            print("TCP server not initialized for direct test")
 
 
 class S2NServer:
+    """Main server class that manages bridges and connections"""
 
     def __init__(self, config):
         self.config = config
 
     def report_exception(self, e):
+        """Report exceptions to syslog if configured"""
         if 'syslog' in self.config:
             try:
                 import usyslog
@@ -283,25 +411,30 @@ class S2NServer:
                 s = usyslog.UDPClient(**self.config['syslog'])
                 s.error(e_string)
                 s.close()
-            except BaseException as e2:
+            except Exception as e2:
+                import sys
                 sys.print_exception(e2)
 
     def serve_forever(self):
+        """Main server loop with error handling and recovery"""
         while True:
-            config_network(self.config)
+            # Configure network before starting server
+            config_network(self.config.get('wlan'), self.config.get('lan'), self.config.get('name'))
+
             try:
                 self._serve_forever()
             except KeyboardInterrupt:
                 print('Ctrl-C pressed. Bailing out')
                 break
-            except BaseException as e:
+            except Exception as e:
                 import sys
                 sys.print_exception(e)
                 self.report_exception(e)
                 time.sleep(1)
-                print("Restarting")
+                print("Restarting after error")
 
     def bind(self):
+        """Bind all configured bridges"""
         bridges = []
         for config in self.config['bridges']:
             bridge = Bridge(config)
@@ -310,75 +443,124 @@ class S2NServer:
         return bridges
 
     def _serve_forever(self):
+        """Internal server loop that manages select and I/O handling"""
+        # Clean up memory before starting
+        gc.collect()
+        print(f"Free memory: {gc.mem_free()} bytes")
+
         bridges = self.bind()
+        if not bridges:
+            print("No bridges initialized successfully")
+            return
+
+        # Uncomment to run direct connection test on the first bridge
+        # if bridges:
+        #     bridges[0].direct_accept_test()
+        #     return
 
         try:
+            print("Starting server loop...")
             while True:
+                # Free memory periodically
+                gc.collect()
+
                 fds = []
                 for bridge in bridges:
                     bridge.fill(fds)
-                rlist, _, xlist = select.select(fds, (), fds)
-                if xlist:
-                    print('Errors. bailing out')
-                    break
-                for fd in rlist:
-                    for bridge in bridges:
-                        bridge.handle(fd)
+
+                if not fds:
+                    print("No file descriptors to monitor, waiting...")
+                    time.sleep(1)
+                    continue
+
+                print(f"Waiting on select with {len(fds)} file descriptors")
+                try:
+                    rlist, _, xlist = select.select(fds, (), fds, 10)  # 10 second timeout
+
+                    print(f"Select returned {len(rlist)} ready, {len(xlist)} exceptions")
+
+                    if xlist:
+                        print('Errors on these descriptors:', xlist)
+                        break
+
+                    for fd in rlist:
+                        for bridge in bridges:
+                            bridge.handle(fd)
+                except Exception as e:
+                    print("Error in select loop:", e)
+                    import sys
+                    sys.print_exception(e)
+                    time.sleep(1)  # Prevent tight error loop
         finally:
             for bridge in bridges:
                 bridge.close()
 
 
-def config_lan(config):
-    if config is None:
+def config_lan(config, name):
+    """Configure Ethernet LAN interface"""
+    if not config:
+        print("No LAN configuration found")
         return None
 
-    # Get parameters from config
+    print("LAN configuration found, initializing...")
+
+    # Get pin configurations or use defaults for ESP32-POE-ISO
     mdc_pin = config.get('mdc', 23)
     mdio_pin = config.get('mdio', 18)
     power_pin = config.get('power', 12)
     phy_type = config.get('phy_type', network.PHY_LAN8720)
     phy_addr = config.get('phy_addr', 0)
 
-    # Initialize LAN
-    print('Initializing Ethernet...')
-    lan = network.LAN(mdc=machine.Pin(mdc_pin), mdio=machine.Pin(mdio_pin),
-                      power=machine.Pin(power_pin), phy_type=phy_type,
-                      phy_addr=phy_addr)
+    print("Initializing Ethernet...")
+    lan = network.LAN(
+        mdc=machine.Pin(mdc_pin),
+        mdio=machine.Pin(mdio_pin),
+        power=machine.Pin(power_pin),
+        phy_type=phy_type,
+        phy_addr=phy_addr
+    )
 
-    # Activate
+    # Set custom hostname if provided
+    if name:
+        lan.config(hostname=name)
+
+    print("Waiting for Ethernet connection...")
     lan.active(True)
-    print('Waiting for Ethernet connection...')
 
-    # Wait for DHCP
-    for i in range(30):
-        if lan.isconnected():
-            print('Ethernet connected as {0}'.format(lan.ifconfig()))
-            return lan
+    print("Waiting for DHCP...")
+    timeout = 15
+    while timeout > 0 and not lan.isconnected():
+        print("Waiting for DHCP...")
         time.sleep(1)
-        print('Waiting for DHCP...')
+        timeout -= 1
 
-    if lan.status() > 0:
-        print('Physical link is up, but no IP address obtained')
+    if lan.isconnected():
+        print(f"Ethernet connected as {lan.ifconfig()}")
+        return lan
     else:
-        print('Physical link is down')
-
-    return lan
+        print("Failed to connect Ethernet")
+        return None
 
 
 def config_wlan(config, name):
+    """Configure WiFi interfaces (station and/or access point)"""
     if config is None:
         return None, None
-    return WLANStation(config.get('sta')), WLANAccessPoint(config.get('ap'), name)
+
+    return (WLANStation(config.get('sta'), name),
+            WLANAccessPoint(config.get('ap'), name))
 
 
-def WLANStation(config):
+def WLANStation(config, name):
+    """Configure WiFi station mode"""
     if config is None:
-        return
+        return None
+
     config.setdefault('connection_attempts', -1)
     essid = config['essid']
     password = config['password']
     attempts_left = config['connection_attempts']
+
     sta = network.WLAN(network.STA_IF)
 
     if not sta.isconnected():
@@ -394,65 +576,87 @@ def WLANStation(config):
             while not sta.isconnected() and n > 0:
                 time.sleep_ms(ms)
                 n -= 1
+
         if not sta.isconnected():
-            print('Failed to connect wifi station after {0}ms. I give up'
-                  .format(t))
-            return sta
-    print('Wifi station connected as {0}'.format(sta.ifconfig()))
+            print(f'Failed to connect WiFi station after {t}ms. Giving up.')
+            return None
+
+    print(f'WiFi station connected as {sta.ifconfig()}')
     return sta
 
 
 def WLANAccessPoint(config, name):
+    """Configure WiFi access point mode"""
     if config is None:
-        return
+        return None
+
     config.setdefault('essid', name)
     config.setdefault('channel', 11)
     config.setdefault('authmode',
                       getattr(network, 'AUTH_' +
                               config.get('authmode', 'OPEN').upper()))
     config.setdefault('hidden', False)
-    #    config.setdefault('dhcp_hostname', name)
+
     ap = network.WLAN(network.AP_IF)
-    if not ap.isconnected():
+
+    if not ap.active():
         ap.active(True)
         n, ms = 20, 250
         t = n * ms
         while not ap.active() and n > 0:
             time.sleep_ms(ms)
             n -= 1
-        if not ap.active():
-            print('Failed to activate wifi access point after {0}ms. ' \
-                  'I give up'.format(t))
-            return ap
 
-    #    ap.config(**config)
-    print('Wifi {0!r} connected as {1}'.format(ap.config('essid'),
-                                               ap.ifconfig()))
+        if not ap.active():
+            print(f'Failed to activate WiFi access point after {t}ms. Giving up.')
+            return None
+
+    # Configure the access point
+    try:
+        ap.config(**config)
+    except:
+        # Fallback for older firmware
+        print("Warning: Could not set full AP configuration")
+
+    print(f'WiFi AP {ap.config("essid")} active with IP {ap.ifconfig()[0]}')
     return ap
 
 
-def config_network(config):
-    if 'lan' in config:
-        print("LAN configuration found, initializing...")
-        config_lan(config.get('lan'))
-    if 'wlan' in config:
-        print("WLAN configuration found, initializing...")
-        config_wlan(config.get('wlan'), config.get('name'))
+def config_network(wlan_config, lan_config, name):
+    """Configure all network interfaces"""
+    # First try Ethernet
+    lan = config_lan(lan_config, name)
+
+    # Then WiFi if needed
+    if not lan or wlan_config:
+        config_wlan(wlan_config, name)
+
+    # Give network time to stabilize
+    time.sleep(1)
 
 
 def config_verbosity(config):
+    """Configure verbosity level for debugging"""
     global VERBOSE
     VERBOSE = config.setdefault('verbose', 1)
-    for bridge in config.get('bridges'):
+
+    for bridge in config.get('bridges', []):
         if bridge.get('uart', {}).get('port', None) == 0:
             VERBOSE = 0
 
 
 def server(config_filename='us2n.json'):
+    """Create and return a server instance with the given configuration"""
     config = read_config(config_filename)
-    VERBOSE = config.setdefault('verbose', 1)
-    name = config.setdefault('name', 'Tiago-ESP32')
+
+    # Set defaults if not present
+    config.setdefault('verbose', 1)
+    config.setdefault('name', 'ESP32-Bridge')
+
     config_verbosity(config)
+
     print(50 * '=')
-    print('Welcome to ESP8266/32 serial <-> tcp bridge\n')
+    print('ESP32-POE-ISO UART <-> TCP Bridge')
+    print(50 * '=')
+
     return S2NServer(config)
