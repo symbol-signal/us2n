@@ -337,7 +337,7 @@ def config_lan(config):
     mdc_pin = config.get('mdc', 23)
     mdio_pin = config.get('mdio', 18)
     power_pin = config.get('power', 12)
-    phy_type = config.get('phy_type', 0)
+    phy_type = config.get('phy_type', network.PHY_LAN8720)
     phy_addr = config.get('phy_addr', 0)
 
     # Initialize LAN
