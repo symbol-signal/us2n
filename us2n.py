@@ -280,6 +280,7 @@ class Bridge:
 
     def _handle_password(self, data):
         """Handle password authentication"""
+        self.password = getattr(self, 'password', b'')
         while len(data):
             c = data[0:1]
             data = data[1:]
@@ -505,6 +506,11 @@ def config_lan(config, name):
         print("No LAN configuration found")
         return None
 
+    # Check if LAN is explicitly enabled
+    if not config.get('enabled', False):
+        print("LAN is not enabled in configuration")
+        return None
+
     print("LAN configuration found, initializing...")
 
     # Get pin configurations or use defaults for ESP32-POE-ISO
@@ -527,21 +533,23 @@ def config_lan(config, name):
     if name:
         lan.config(hostname=name)
 
-    print("Waiting for Ethernet connection...")
+    print("Activating Ethernet interface...")
     lan.active(True)
 
-    print("Waiting for DHCP...")
+    print("Waiting for Ethernet connection...")
     timeout = 15
     while timeout > 0 and not lan.isconnected():
-        print("Waiting for DHCP...")
+        print(f"Waiting for DHCP... ({timeout}s remaining)")
         time.sleep(1)
         timeout -= 1
 
     if lan.isconnected():
-        print(f"Ethernet connected as {lan.ifconfig()}")
+        print(f"Ethernet connected successfully!")
+        print(f"IP configuration: {lan.ifconfig()}")
         return lan
     else:
         print("Failed to connect Ethernet")
+        lan.active(False)
         return None
 
 
@@ -550,8 +558,18 @@ def config_wlan(config, name):
     if config is None:
         return None, None
 
-    return (WLANStation(config.get('sta'), name),
-            WLANAccessPoint(config.get('ap'), name))
+    sta = None
+    ap = None
+
+    # Only configure station if explicitly requested
+    if config.get('sta') is not None:
+        sta = WLANStation(config.get('sta'), name)
+
+    # Only configure AP if explicitly requested
+    if config.get('ap') is not None:
+        ap = WLANAccessPoint(config.get('ap'), name)
+
+    return sta, ap
 
 
 def WLANStation(config, name):
@@ -559,32 +577,56 @@ def WLANStation(config, name):
     if config is None:
         return None
 
-    config.setdefault('connection_attempts', -1)
-    essid = config['essid']
-    password = config['password']
+    # Check if station mode is enabled
+    if not config.get('enabled', True):
+        print("WiFi station mode is disabled")
+        return None
+
+    config.setdefault('connection_attempts', 3)
+    essid = config.get('essid')
+    password = config.get('password')
+
+    if not essid:
+        print("No ESSID configured for WiFi station")
+        return None
+
     attempts_left = config['connection_attempts']
 
     sta = network.WLAN(network.STA_IF)
 
+    # Deactivate first to ensure clean state
+    sta.active(False)
+    time.sleep(0.5)
+
+    # Activate WiFi interface
+    sta.active(True)
+
     if not sta.isconnected():
         while not sta.isconnected() and attempts_left != 0:
             attempts_left -= 1
-            sta.disconnect()
-            sta.active(False)
-            sta.active(True)
+            print(
+                f'Connecting to WiFi network "{essid}" (attempt {config["connection_attempts"] - attempts_left}/{config["connection_attempts"]})...')
             sta.connect(essid, password)
-            print('Connecting to WiFi...')
+
+            # Wait for connection
             n, ms = 20, 250
             t = n * ms
             while not sta.isconnected() and n > 0:
                 time.sleep_ms(ms)
                 n -= 1
 
+            if not sta.isconnected() and attempts_left > 0:
+                print("Connection failed, retrying...")
+                sta.disconnect()
+                time.sleep(1)
+
         if not sta.isconnected():
-            print(f'Failed to connect WiFi station after {t}ms. Giving up.')
+            print(f'Failed to connect to WiFi station after {config["connection_attempts"]} attempts. Giving up.')
+            sta.active(False)
             return None
 
-    print(f'WiFi station connected as {sta.ifconfig()}')
+    print(f'WiFi station connected to "{essid}"')
+    print(f'IP configuration: {sta.ifconfig()}')
     return sta
 
 
@@ -593,46 +635,79 @@ def WLANAccessPoint(config, name):
     if config is None:
         return None
 
-    config.setdefault('essid', name)
+    # Check if AP mode is enabled
+    if not config.get('enabled', True):
+        print("WiFi access point mode is disabled")
+        return None
+
+    config.setdefault('essid', name or 'ESP32-Bridge')
     config.setdefault('channel', 11)
-    config.setdefault('authmode',
-                      getattr(network, 'AUTH_' +
-                              config.get('authmode', 'OPEN').upper()))
+    config.setdefault('authmode', getattr(network, 'AUTH_' + config.get('authmode', 'OPEN').upper(), network.AUTH_OPEN))
     config.setdefault('hidden', False)
+    config.setdefault('max_clients', 4)
 
     ap = network.WLAN(network.AP_IF)
 
-    if not ap.active():
-        ap.active(True)
-        n, ms = 20, 250
-        t = n * ms
-        while not ap.active() and n > 0:
-            time.sleep_ms(ms)
-            n -= 1
+    # Deactivate first to ensure clean state
+    ap.active(False)
+    time.sleep(0.5)
 
-        if not ap.active():
-            print(f'Failed to activate WiFi access point after {t}ms. Giving up.')
-            return None
+    # Activate AP interface
+    ap.active(True)
+
+    # Wait for activation
+    n, ms = 20, 250
+    t = n * ms
+    while not ap.active() and n > 0:
+        time.sleep_ms(ms)
+        n -= 1
+
+    if not ap.active():
+        print(f'Failed to activate WiFi access point after {t}ms. Giving up.')
+        return None
 
     # Configure the access point
     try:
-        ap.config(**config)
-    except:
-        # Fallback for older firmware
-        print("Warning: Could not set full AP configuration")
+        # Remove 'enabled' from config dict before passing to ap.config()
+        ap_config = {k: v for k, v in config.items() if k != 'enabled'}
+        ap.config(**ap_config)
+    except Exception as e:
+        # Fallback for older firmware or unsupported parameters
+        print(f"Warning: Could not set full AP configuration: {e}")
+        # Try basic configuration
+        try:
+            ap.config(essid=config['essid'])
+            if 'password' in config:
+                ap.config(password=config['password'])
+                ap.config(authmode=config['authmode'])
+        except:
+            pass
 
-    print(f'WiFi AP {ap.config("essid")} active with IP {ap.ifconfig()[0]}')
+    print(f'WiFi AP "{ap.config("essid")}" active')
+    print(f'IP configuration: {ap.ifconfig()}')
     return ap
 
 
 def config_network(wlan_config, lan_config, name):
     """Configure all network interfaces"""
-    # First try Ethernet
-    lan = config_lan(lan_config, name)
+    network_configured = False
 
-    # Then WiFi if needed
-    if not lan or wlan_config:
-        config_wlan(wlan_config, name)
+    # First try Ethernet
+    if lan_config:
+        lan = config_lan(lan_config, name)
+        if lan:
+            network_configured = True
+
+    # Then WiFi if configured
+    if wlan_config:
+        sta, ap = config_wlan(wlan_config, name)
+        if sta or ap:
+            network_configured = True
+
+    if not network_configured:
+        print("WARNING: No network interfaces configured successfully!")
+        print("The bridge will start but won't be accessible over network.")
+        print("Please check your configuration file.")
 
     # Give network time to stabilize
     time.sleep(1)
