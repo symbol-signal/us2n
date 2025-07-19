@@ -1,13 +1,14 @@
 # us2n.py - UART to TCP Bridge for ESP32-POE-ISO
 # Revised version with Ethernet support and improved error handling
 
+import gc
 import json
-import time
 import select
 import socket
+import time
+
 import machine
 import network
-import gc
 
 # Configure verbosity for debugging
 VERBOSE = 1
@@ -445,7 +446,15 @@ class S2NServer:
         """Bind all configured bridges"""
         bridges = []
         for config in self.config['bridges']:
-            bridge = Bridge(config)
+            bridge_type = config.get('type', 'uart')
+            if bridge_type == 'uart':
+                bridge = Bridge(config)
+            elif bridge_type == 'i2c':
+                from i2c_bridge import I2CBridge
+                bridge = I2CBridge(config)
+            else:
+                print(f"Unknown bridge type: {bridge_type}, skipping")
+                continue
             bridge.bind()
             bridges.append(bridge)
         return bridges

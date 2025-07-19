@@ -1,0 +1,50 @@
+{
+  "name": "ESP32-DualBridge",
+  "verbose": 1,
+  "lan": {
+    "enabled": true,
+    "mdc": 23,
+    "mdio": 18,
+    "power": 12,
+    "phy_type": 8,
+    "phy_addr": 0
+  },
+  "wlan": {
+    "sta": {
+      "enabled": false,
+      "essid": "YourWiFiSSID",
+      "password": "YourWiFiPassword"
+    }
+  },
+  "bridges": [
+    {
+      "type": "uart",
+      "tcp": {
+        "bind": ":20202"
+      },
+      "uart": {
+        "port": 2,
+        "baudrate": 115200,
+        "bytesize": 8,
+        "parity": null,
+        "stopbits": 1,
+        "timeout": 0,
+        "timeout_char": 1,
+        "tx": 17,
+        "rx": 16
+      }
+    },
+    {
+      "type": "i2c",
+      "tcp": {
+        "bind": ":20203"
+      },
+      "i2c": {
+        "id": 0,
+        "sda": 21,
+        "scl": 22,
+        "freq": 400000
+      }
+    }
+  ]
+}
