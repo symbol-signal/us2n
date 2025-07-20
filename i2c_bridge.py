@@ -218,16 +218,12 @@ class I2CBridge:
             if length > 32:
                 return self._error_response(self.STATUS_INVALID_PARAM)
             buf = bytearray(length)
+            #print(f"DEBUG: raw_read addr={hex(addr)}, length={length}")  # Add this
             self.i2c.readfrom_into(addr, buf)
             return self._success_response(buf)
         except OSError as e:
-            print(f"I2C error: {e}")
+            print(f"I2C error on addr {hex(addr)}: {e}")  # Enhanced
             return self._error_response(self.STATUS_NACK)
-        except Exception as e:
-            print(f"Raw read error: {e}")
-            import sys
-            sys.print_exception(e)
-            return self._error_response(self.STATUS_ERROR)
 
     def _execute_command(self, cmd, addr, reg, data):
         """Execute an I2C command and return response"""
@@ -282,8 +278,10 @@ class I2CBridge:
         """Build an error response"""
         return bytes([status, 0x00, 0x00])
 
-    def _cmd_read_byte(self, addr):
-        """Read single byte from device"""
+    def _cmd_read_byte_data(self, addr, reg):
+        """Read byte from register"""
+        #print(f"DEBUG: read_byte_data addr={hex(addr)}, reg={hex(reg)}")  # Add this
+        self.i2c.writeto(addr, bytes([reg]))
         buf = bytearray(1)
         self.i2c.readfrom_into(addr, buf)
         return self._success_response(buf)
@@ -295,12 +293,13 @@ class I2CBridge:
         self.i2c.writeto(addr, data)
         return self._success_response()
 
-    def _cmd_read_byte_data(self, addr, reg):
-        """Read byte from register"""
-        self.i2c.writeto(addr, bytes([reg]))
-        buf = bytearray(1)
-        self.i2c.readfrom_into(addr, buf)
-        return self._success_response(buf)
+    def _cmd_write_byte_data(self, addr, reg, data):
+        """Write byte to register"""
+        #print(f"DEBUG: write_byte_data addr={hex(addr)}, reg={hex(reg)}, data={data.hex()}")  # Add this
+        if len(data) != 1:
+            return self._error_response(self.STATUS_INVALID_PARAM)
+        self.i2c.writeto(addr, bytes([reg]) + data)
+        return self._success_response()
 
     def _cmd_write_byte_data(self, addr, reg, data):
         """Write byte to register"""
@@ -365,6 +364,7 @@ class I2CBridge:
 
     def _cmd_write_raw(self, addr, data):
         """Write raw I2C data without register"""
+        #print(f"DEBUG: write_raw addr={hex(addr)}, data={data.hex()}")  # Add this
         if len(data) > 32:
             return self._error_response(self.STATUS_INVALID_PARAM)
         self.i2c.writeto(addr, data)
@@ -394,7 +394,9 @@ class I2CBridge:
 
     def _cmd_scan(self):
         """Scan I2C bus for devices"""
+        #print("DEBUG: I2C scan requested")  # Add this
         devices = self.i2c.scan()
+        #print(f"DEBUG: Found devices: {[hex(d) for d in devices]}")  # Add this
         return self._success_response(bytes(devices))
 
     def _cmd_set_speed(self, data):
