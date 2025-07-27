@@ -218,11 +218,10 @@ class I2CBridge:
             if length > 32:
                 return self._error_response(self.STATUS_INVALID_PARAM)
             buf = bytearray(length)
-            #print(f"DEBUG: raw_read addr={hex(addr)}, length={length}")  # Add this
             self.i2c.readfrom_into(addr, buf)
             return self._success_response(buf)
         except OSError as e:
-            print(f"I2C error on addr {hex(addr)}: {e}")  # Enhanced
+            print(f"I2C error on addr {hex(addr)}: {e}")
             return self._error_response(self.STATUS_NACK)
 
     def _execute_command(self, cmd, addr, reg, data):
@@ -278,10 +277,8 @@ class I2CBridge:
         """Build an error response"""
         return bytes([status, 0x00, 0x00])
 
-    def _cmd_read_byte_data(self, addr, reg):
-        """Read byte from register"""
-        #print(f"DEBUG: read_byte_data addr={hex(addr)}, reg={hex(reg)}")  # Add this
-        self.i2c.writeto(addr, bytes([reg]))
+    def _cmd_read_byte(self, addr):
+        """Read single byte from device"""
         buf = bytearray(1)
         self.i2c.readfrom_into(addr, buf)
         return self._success_response(buf)
@@ -293,110 +290,143 @@ class I2CBridge:
         self.i2c.writeto(addr, data)
         return self._success_response()
 
-    def _cmd_write_byte_data(self, addr, reg, data):
-        """Write byte to register"""
-        #print(f"DEBUG: write_byte_data addr={hex(addr)}, reg={hex(reg)}, data={data.hex()}")  # Add this
-        if len(data) != 1:
-            return self._error_response(self.STATUS_INVALID_PARAM)
-        self.i2c.writeto(addr, bytes([reg]) + data)
-        return self._success_response()
+    def _cmd_read_byte_data(self, addr, reg):
+        """Read byte from register"""
+        try:
+            # Use readfrom_mem which handles repeated start correctly
+            buf = self.i2c.readfrom_mem(addr, reg, 1)
+            return self._success_response(buf)
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_byte_data(self, addr, reg, data):
         """Write byte to register"""
         if len(data) != 1:
             return self._error_response(self.STATUS_INVALID_PARAM)
-        self.i2c.writeto(addr, bytes([reg]) + data)
-        return self._success_response()
+        try:
+            self.i2c.writeto_mem(addr, reg, data)
+            return self._success_response()
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_read_word_data(self, addr, reg):
         """Read word from register (little-endian)"""
-        self.i2c.writeto(addr, bytes([reg]))
-        buf = bytearray(2)
-        self.i2c.readfrom_into(addr, buf)
-        return self._success_response(buf)
+        try:
+            # Use readfrom_mem which handles repeated start correctly
+            buf = self.i2c.readfrom_mem(addr, reg, 2)
+            return self._success_response(buf)
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_word_data(self, addr, reg, data):
         """Write word to register (little-endian)"""
         if len(data) != 2:
             return self._error_response(self.STATUS_INVALID_PARAM)
-        self.i2c.writeto(addr, bytes([reg]) + data)
-        return self._success_response()
+        try:
+            self.i2c.writeto_mem(addr, reg, data)
+            return self._success_response()
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_read_block_data(self, addr, reg):
         """Read SMBus block (first byte is length)"""
-        self.i2c.writeto(addr, bytes([reg]))
-        # Read length byte first
-        length_buf = bytearray(1)
-        self.i2c.readfrom_into(addr, length_buf)
-        length = length_buf[0]
-        if length > 32:
-            length = 32
-        # Read the rest of the block
-        data_buf = bytearray(length)
-        self.i2c.readfrom_into(addr, data_buf)
-        # Return length byte + data
-        return self._success_response(length_buf + data_buf)
+        try:
+            # First read the length byte
+            length_buf = self.i2c.readfrom_mem(addr, reg, 1)
+            length = length_buf[0]
+            if length > 32:
+                length = 32
+
+            # Read length + 1 bytes (length byte + data)
+            buf = self.i2c.readfrom_mem(addr, reg, length + 1)
+            return self._success_response(buf)
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_block_data(self, addr, reg, data):
         """Write SMBus block"""
         if len(data) > 32:
             return self._error_response(self.STATUS_INVALID_PARAM)
-        # Prepend length byte
-        self.i2c.writeto(addr, bytes([reg, len(data)]) + data)
-        return self._success_response()
+        try:
+            # Prepend length byte
+            block_data = bytes([len(data)]) + data
+            self.i2c.writeto_mem(addr, reg, block_data)
+            return self._success_response()
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_read_i2c_block(self, addr, reg):
         """Read I2C block of specified length"""
-        # Use the stored pending_length
-        length = min(self.pending_length or 32, 32)
-        self.i2c.writeto(addr, bytes([reg]))
-        buf = bytearray(length)
-        self.i2c.readfrom_into(addr, buf)
-        self.pending_length = None  # Clear after use
-        return self._success_response(buf)
+        try:
+            # Use the stored pending_length
+            length = min(self.pending_length or 32, 32)
+            buf = self.i2c.readfrom_mem(addr, reg, length)
+            self.pending_length = None  # Clear after use
+            return self._success_response(buf)
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_i2c_block(self, addr, reg, data):
         """Write I2C block"""
         if len(data) > 32:
             return self._error_response(self.STATUS_INVALID_PARAM)
-        self.i2c.writeto(addr, bytes([reg]) + data)
-        return self._success_response()
+        try:
+            self.i2c.writeto_mem(addr, reg, data)
+            return self._success_response()
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_raw(self, addr, data):
         """Write raw I2C data without register"""
-        #print(f"DEBUG: write_raw addr={hex(addr)}, data={data.hex()}")  # Add this
         if len(data) > 32:
             return self._error_response(self.STATUS_INVALID_PARAM)
-        self.i2c.writeto(addr, data)
-        return self._success_response()
+        try:
+            self.i2c.writeto(addr, data)
+            return self._success_response()
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_write_read(self, addr, read_length, write_data):
         """Combined write-then-read with repeated start"""
-        # Note: read_length is passed in the reg field
         if len(write_data) > 32 or read_length > 32:
             return self._error_response(self.STATUS_INVALID_PARAM)
 
-        # MicroPython doesn't have a direct write-then-read method
-        # We'll use writeto with stop=False followed by readfrom
         try:
-            # Write without stop bit
-            self.i2c.writeto(addr, write_data, stop=False)
-            # Read with repeated start
-            buf = bytearray(read_length)
-            self.i2c.readfrom_into(addr, buf)
-            return self._success_response(buf)
-        except:
-            # If stop=False not supported, fall back to regular write then read
-            self.i2c.writeto(addr, write_data)
-            buf = bytearray(read_length)
-            self.i2c.readfrom_into(addr, buf)
-            return self._success_response(buf)
+            # For single register reads, use readfrom_mem
+            if len(write_data) == 1:
+                buf = self.i2c.readfrom_mem(addr, write_data[0], read_length)
+                return self._success_response(buf)
+            else:
+                # For multi-byte writes, try with stop=False first
+                try:
+                    # Write without stop bit
+                    self.i2c.writeto(addr, write_data, stop=False)
+                    # Read with repeated start
+                    buf = bytearray(read_length)
+                    self.i2c.readfrom_into(addr, buf)
+                    return self._success_response(buf)
+                except:
+                    # If stop=False not supported, fall back to regular write then read
+                    self.i2c.writeto(addr, write_data)
+                    buf = bytearray(read_length)
+                    self.i2c.readfrom_into(addr, buf)
+                    return self._success_response(buf)
+        except OSError as e:
+            print(f"I2C error: {e}")
+            return self._error_response(self.STATUS_NACK)
 
     def _cmd_scan(self):
         """Scan I2C bus for devices"""
-        #print("DEBUG: I2C scan requested")  # Add this
         devices = self.i2c.scan()
-        #print(f"DEBUG: Found devices: {[hex(d) for d in devices]}")  # Add this
         return self._success_response(bytes(devices))
 
     def _cmd_set_speed(self, data):
@@ -423,10 +453,11 @@ class I2CBridge:
     def _cmd_get_info(self):
         """Get bridge information"""
         info = {
-            'version': '1.1',
+            'version': '1.2',
             'protocol': 'SMBus2',
             'max_block_size': 32,
-            'supports_raw': True
+            'supports_raw': True,
+            'supports_mem': True
         }
         info_str = str(info).encode('utf-8')
         return self._success_response(info_str)
